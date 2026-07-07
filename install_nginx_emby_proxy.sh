@@ -20,6 +20,22 @@ read_with_default() {
   printf '%s' "${value:-$default_value}"
 }
 
+read_yes_no() {
+  local prompt="$1"
+  local default_value="$2"
+  local value
+
+  while true; do
+    read -r -p "${prompt} [${default_value}]: " value
+    value="${value:-$default_value}"
+    case "$value" in
+      y|Y|yes|YES|Yes|是) return 0 ;;
+      n|N|no|NO|No|否) return 1 ;;
+      *) echo "请输入 y 或 n。" ;;
+    esac
+  done
+}
+
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "缺少命令：$1"
@@ -59,13 +75,14 @@ port_has_listener() {
 check_host_port() {
   local port="$1"
   local label="$2"
+  local hint="$3"
   local conflicting_containers
 
   conflicting_containers="$(docker ps --filter "publish=$port" --format '{{.Names}}' | grep -vx "$CONTAINER_NAME" || true)"
   if [ -n "$conflicting_containers" ]; then
     echo "端口 ${port} 已被其他 Docker 容器占用："
     echo "$conflicting_containers"
-    echo "请重新运行脚本，把 ${label} 换成其他端口，比如 18443、9443、8080。"
+    echo "$hint"
     exit 1
   fi
 
@@ -75,7 +92,7 @@ check_host_port() {
 
   if port_has_listener "$port"; then
     echo "端口 ${port} 已被系统进程占用。"
-    echo "请重新运行脚本，把 ${label} 换成其他端口，比如 18443、9443、8080。"
+    echo "$hint"
     exit 1
   fi
 }
@@ -89,7 +106,11 @@ fi
 EMBY_HOST="$(read_with_default "请输入 Emby 地址/域名，不要带 http:// 或 https://" "server3.cn2gias.uk")"
 EMBY_PORT="$(read_with_default "请输入 Emby 端口" "443")"
 UPSTREAM_SCHEME="$(read_with_default "请输入 Emby 协议：http 或 https" "https")"
-HOST_HTTP_PORT="$(read_with_default "请输入宿主机 HTTP 端口" "80")"
+if read_yes_no "是否开启 80 端口首页入口" "y"; then
+  ENABLE_HTTP_80="yes"
+else
+  ENABLE_HTTP_80="no"
+fi
 HOST_PROXY_PORT="$(read_with_default "请输入宿主机反代端口" "8443")"
 BASE_DIR="$(read_with_default "请输入 nginx 挂载目录" "/docker/nginx")"
 
@@ -101,8 +122,8 @@ case "$UPSTREAM_SCHEME" in
     ;;
 esac
 
-if [ -z "$EMBY_HOST" ] || [ -z "$EMBY_PORT" ] || [ -z "$HOST_HTTP_PORT" ] || [ -z "$HOST_PROXY_PORT" ]; then
-  echo "Emby 地址、Emby 端口、宿主机端口不能为空。"
+if [ -z "$EMBY_HOST" ] || [ -z "$EMBY_PORT" ] || [ -z "$HOST_PROXY_PORT" ]; then
+  echo "Emby 地址、Emby 端口、宿主机反代端口不能为空。"
   exit 1
 fi
 
@@ -111,23 +132,21 @@ if ! is_valid_port "$EMBY_PORT"; then
   exit 1
 fi
 
-if ! is_valid_port "$HOST_HTTP_PORT"; then
-  echo "宿主机 HTTP 端口不合法：$HOST_HTTP_PORT"
-  exit 1
-fi
-
 if ! is_valid_port "$HOST_PROXY_PORT"; then
   echo "宿主机反代端口不合法：$HOST_PROXY_PORT"
   exit 1
 fi
 
-if [ "$HOST_HTTP_PORT" = "$HOST_PROXY_PORT" ]; then
-  echo "宿主机 HTTP 端口和反代端口不能相同。"
+if [ "$HOST_PROXY_PORT" = "80" ]; then
+  echo "宿主机反代端口不能填写 80。"
+  echo "80 只用于可选的首页入口；反代端口请填写 18443、9443、8088 等其他端口。"
   exit 1
 fi
 
-check_host_port "$HOST_HTTP_PORT" "宿主机 HTTP 端口"
-check_host_port "$HOST_PROXY_PORT" "宿主机反代端口"
+if [ "$ENABLE_HTTP_80" = "yes" ]; then
+  check_host_port "80" "80 端口首页入口" "如果不需要首页入口，请重新运行脚本并选择不开启 80；如果需要 80，请先释放该端口。"
+fi
+check_host_port "$HOST_PROXY_PORT" "宿主机反代端口" "请重新运行脚本，把宿主机反代端口换成其他端口，比如 18443、9443、8088。"
 
 mkdir -p \
   "$BASE_DIR/conf/conf.d" \
@@ -253,19 +272,30 @@ if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
   docker rm -f "$CONTAINER_NAME" >/dev/null
 fi
 
-docker run \
-  --restart always \
-  --name "$CONTAINER_NAME" \
-  -v "$BASE_DIR/html:/usr/share/nginx/html" \
-  -v "$BASE_DIR/conf/nginx.conf:/etc/nginx/nginx.conf" \
-  -v "$BASE_DIR/conf/conf.d:/etc/nginx/conf.d" \
-  -v "$BASE_DIR/log:/var/log/nginx" \
-  -p "${HOST_HTTP_PORT}:80" \
-  -p "${HOST_PROXY_PORT}:${HOST_PROXY_PORT}" \
-  -d "$IMAGE_NAME" >/dev/null
+DOCKER_RUN_ARGS=(
+  run
+  --restart always
+  --name "$CONTAINER_NAME"
+  -v "$BASE_DIR/html:/usr/share/nginx/html"
+  -v "$BASE_DIR/conf/nginx.conf:/etc/nginx/nginx.conf"
+  -v "$BASE_DIR/conf/conf.d:/etc/nginx/conf.d"
+  -v "$BASE_DIR/log:/var/log/nginx"
+  -p "${HOST_PROXY_PORT}:${HOST_PROXY_PORT}"
+)
+
+if [ "$ENABLE_HTTP_80" = "yes" ]; then
+  DOCKER_RUN_ARGS+=( -p "80:80" )
+fi
+
+DOCKER_RUN_ARGS+=( -d "$IMAGE_NAME" )
+docker "${DOCKER_RUN_ARGS[@]}" >/dev/null
 
 echo "完成。"
 echo "容器名称：$CONTAINER_NAME"
-echo "静态页面：http://127.0.0.1:${HOST_HTTP_PORT}/"
+if [ "$ENABLE_HTTP_80" = "yes" ]; then
+  echo "静态页面：http://127.0.0.1/"
+else
+  echo "静态页面：未开启 80 端口首页入口"
+fi
 echo "Emby 反代：http://127.0.0.1:${HOST_PROXY_PORT}/"
 echo "配置文件：$BASE_DIR/conf/conf.d/default.conf"
