@@ -71,6 +71,7 @@ Emby 反代：http://服务器IP:8443/
 - 创建 `/docker/nginx` 挂载目录
 - 从官方 Nginx 镜像提取默认 `nginx.conf` 和首页文件
 - 生成 Emby 反代配置 `default.conf`
+- 启动前检查宿主机端口是否被占用
 - 支持 WebSocket、Range 断点续传和长连接
 - 隐藏常见真实 IP / 代理链请求头
 - 启动 `--restart always` 的 Nginx 容器
@@ -100,6 +101,46 @@ docker restart nginx
 ```bash
 docker exec nginx nginx -t && docker restart nginx
 ```
+
+## 常见问题
+
+### 端口已经被占用
+
+如果看到类似提示：
+
+```text
+Bind for 0.0.0.0:8443 failed: port is already allocated
+```
+
+说明宿主机的 `8443` 端口已经被其他程序或容器占用。重新运行脚本，在“宿主机反代端口”那里不要直接回车，改填一个没被占用的端口，例如：
+
+```text
+18443
+9443
+8088
+```
+
+然后用新端口访问：
+
+```text
+http://服务器IP:新端口/
+```
+
+查看哪些容器正在占用端口：
+
+```bash
+docker ps
+```
+
+### read-only file system 提示
+
+旧版本脚本在检查配置时，可能会看到：
+
+```text
+can not modify /etc/nginx/conf.d/default.conf (read-only file system?)
+```
+
+这不是配置失败的原因。新版脚本已经调整检查方式，正常情况下不会再出现这个干扰提示。
 
 ## 注意事项
 

@@ -27,6 +27,59 @@ require_command() {
   fi
 }
 
+is_valid_port() {
+  local port="$1"
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null
+}
+
+port_has_listener() {
+  local port="$1"
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :$port" 2>/dev/null | grep -q .
+    return $?
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"
+    return $?
+  fi
+
+  return 1
+}
+
+check_host_port() {
+  local port="$1"
+  local label="$2"
+  local conflicting_containers
+
+  conflicting_containers="$(docker ps --filter "publish=$port" --format '{{.Names}}' | grep -vx "$CONTAINER_NAME" || true)"
+  if [ -n "$conflicting_containers" ]; then
+    echo "端口 ${port} 已被其他 Docker 容器占用："
+    echo "$conflicting_containers"
+    echo "请重新运行脚本，把 ${label} 换成其他端口，比如 18443、9443、8080。"
+    exit 1
+  fi
+
+  if docker ps --filter "name=${CONTAINER_NAME}" --filter "publish=$port" --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+    return 0
+  fi
+
+  if port_has_listener "$port"; then
+    echo "端口 ${port} 已被系统进程占用。"
+    echo "请重新运行脚本，把 ${label} 换成其他端口，比如 18443、9443、8080。"
+    exit 1
+  fi
+}
+
 require_command docker
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -52,6 +105,29 @@ if [ -z "$EMBY_HOST" ] || [ -z "$EMBY_PORT" ] || [ -z "$HOST_HTTP_PORT" ] || [ -
   echo "Emby 地址、Emby 端口、宿主机端口不能为空。"
   exit 1
 fi
+
+if ! is_valid_port "$EMBY_PORT"; then
+  echo "Emby 端口不合法：$EMBY_PORT"
+  exit 1
+fi
+
+if ! is_valid_port "$HOST_HTTP_PORT"; then
+  echo "宿主机 HTTP 端口不合法：$HOST_HTTP_PORT"
+  exit 1
+fi
+
+if ! is_valid_port "$HOST_PROXY_PORT"; then
+  echo "宿主机反代端口不合法：$HOST_PROXY_PORT"
+  exit 1
+fi
+
+if [ "$HOST_HTTP_PORT" = "$HOST_PROXY_PORT" ]; then
+  echo "宿主机 HTTP 端口和反代端口不能相同。"
+  exit 1
+fi
+
+check_host_port "$HOST_HTTP_PORT" "宿主机 HTTP 端口"
+check_host_port "$HOST_PROXY_PORT" "宿主机反代端口"
 
 mkdir -p \
   "$BASE_DIR/conf/conf.d" \
@@ -165,12 +241,12 @@ server {
 EOF
 
 echo "检查 nginx 配置..."
-docker run --rm \
+docker run --rm --entrypoint nginx \
   -v "$BASE_DIR/html:/usr/share/nginx/html:ro" \
   -v "$BASE_DIR/conf/nginx.conf:/etc/nginx/nginx.conf:ro" \
   -v "$BASE_DIR/conf/conf.d:/etc/nginx/conf.d:ro" \
   -v "$BASE_DIR/log:/var/log/nginx" \
-  "$IMAGE_NAME" nginx -t
+  "$IMAGE_NAME" -t
 
 if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
   echo "删除旧容器：$CONTAINER_NAME"
